@@ -9,18 +9,18 @@ export default defineConfig({
     description: "CRM Kanban local para leads do Instagram (uso interno).",
     version: "0.0.1",
 
-    permissions: ["storage", "sidePanel", "alarms", "downloads", "unlimitedStorage"],
+    // tabs = abrir/focar dashboard
+    permissions: ["storage", "sidePanel", "tabs", "alarms", "downloads", "unlimitedStorage"],
     optional_permissions: ["notifications"],
-
-    // ✅ IMPORTANTE: permitir instagram.com e www.instagram.com
     host_permissions: ["https://www.instagram.com/*", "https://instagram.com/*"],
 
     action: {
       default_title: "CRM IGNIS",
+      default_popup: "popup.html",
     },
 
     side_panel: {
-      default_path: "sidepanel/index.html",
+      default_path: "sidepanel.html",
     },
   },
 

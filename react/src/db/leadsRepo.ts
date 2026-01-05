@@ -12,43 +12,43 @@ export type AddLeadResult =
 export async function addLead(input: {
   workspaceId: string;
   board: BoardType;
-  stageId: string;
+  stageId?: string;
   username: string;
   displayName?: string;
 }): Promise<AddLeadResult> {
   const now = Date.now();
-  const usernameLower = input.username.toLowerCase().trim();
+  const usernameLower = String(input.username || "").toLowerCase().trim();
+  const stageId = (input.stageId && String(input.stageId).trim()) || "Leads novos";
 
-  // 1) Checar duplicado: mesmo workspace + mesmo username
+  if (!input.workspaceId) throw new Error("workspaceId obrigatório");
+  if (!usernameLower) throw new Error("username obrigatório");
+  if (input.board !== "OUTBOUND" && input.board !== "SOCIAL") throw new Error("board inválido");
+
+  // Duplicado: mesmo workspace + mesmo username
   const existing = await db.leads
     .where("[workspaceId+usernameLower]")
     .equals([input.workspaceId, usernameLower])
     .first();
 
   if (existing) {
-    // Atualiza lastTouched porque você tentou adicionar de novo
-    await db.leads.update(existing.id, { lastTouchedAt: now, updatedAt: now });
-    const refreshed = (await db.leads.get(existing.id))!;
-    return { status: "exists", lead: refreshed };
+    return { status: "exists", lead: existing };
   }
 
-  // 2) Criar lead novo
-  const leadId = newId();
-
   const lead: Lead = {
-    id: leadId,
+    id: newId(),
     workspaceId: input.workspaceId,
 
     board: input.board,
-    stageId: input.stageId,
+    stageId,
 
-    username: input.username.trim(),
+    username: String(input.username).trim().replace(/^@/, ""),
     usernameLower,
 
-    displayName: input.displayName ?? "",
+    displayName: input.displayName?.trim() || undefined,
 
     priority: "medium",
     tags: [],
+
     notes: "",
 
     createdAt: now,
@@ -56,17 +56,15 @@ export async function addLead(input: {
     lastTouchedAt: now,
   };
 
-  // 3) Criar evento de auditoria (Activity Log)
   const event: ActivityEvent = {
     id: newId(),
-    workspaceId: input.workspaceId,
-    leadId: leadId,
+    workspaceId: lead.workspaceId,
+    leadId: lead.id,
     type: "CREATED",
     at: now,
     day: toDayKey(now),
   };
 
-  // 4) Salvar tudo em transação (ou salva tudo ou nada)
   await db.transaction("rw", db.leads, db.events, async () => {
     await db.leads.add(lead);
     await db.events.add(event);
@@ -75,30 +73,92 @@ export async function addLead(input: {
   return { status: "created", lead };
 }
 
-/**
- * Lista leads APENAS do board selecionado (OUTBOUND ou SOCIAL)
- * Usa o índice [workspaceId+board+stageId] e pega o range inteiro.
- */
 export async function listLeadsByBoard(workspaceId: string, board: BoardType) {
   const items = await db.leads
     .where("[workspaceId+board+stageId]")
     .between([workspaceId, board, Dexie.minKey], [workspaceId, board, Dexie.maxKey])
     .toArray();
 
-  // Ordena por mais recente (updatedAt desc)
   items.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
   return items;
 }
 
-/**
- * Exclui o lead + todos os registros ligados a ele:
- * - tasks do lead
- * - events do lead
- */
-export async function deleteLead(input: {
+export async function updateLead(input: {
   workspaceId: string;
   leadId: string;
+  patch: Partial<
+    Pick<Lead, "board" | "stageId" | "notes" | "tags" | "priority" | "displayName" | "nextFollowUpAt">
+  >;
 }) {
+  const lead = await db.leads.get(input.leadId);
+  if (!lead) return null;
+  if (lead.workspaceId !== input.workspaceId) return null;
+
+  const now = Date.now();
+  const patch = { ...input.patch };
+
+  const next: Lead = {
+    ...lead,
+    ...patch,
+    stageId: patch.stageId ? String(patch.stageId).trim() : lead.stageId,
+    updatedAt: now,
+    lastTouchedAt: now,
+  };
+
+  const events: ActivityEvent[] = [];
+
+  if (next.stageId !== lead.stageId) {
+    events.push({
+      id: newId(),
+      workspaceId: lead.workspaceId,
+      leadId: lead.id,
+      type: "MOVED_STAGE",
+      fromStageId: lead.stageId,
+      toStageId: next.stageId,
+      at: now,
+      day: toDayKey(now),
+    });
+  }
+
+  if (next.notes !== lead.notes) {
+    events.push({
+      id: newId(),
+      workspaceId: lead.workspaceId,
+      leadId: lead.id,
+      type: "NOTE_UPDATED",
+      at: now,
+      day: toDayKey(now),
+    });
+  }
+
+  if (next.priority !== lead.priority) {
+    events.push({
+      id: newId(),
+      workspaceId: lead.workspaceId,
+      leadId: lead.id,
+      type: "PRIORITY_CHANGED",
+      at: now,
+      day: toDayKey(now),
+    });
+  }
+
+  await db.transaction("rw", db.leads, db.events, async () => {
+    await db.leads.put(next);
+    if (events.length) await db.events.bulkAdd(events);
+  });
+
+  return next;
+}
+
+export async function moveLeadStage(input: { workspaceId: string; leadId: string; toStageId: string }) {
+  return updateLead({
+    workspaceId: input.workspaceId,
+    leadId: input.leadId,
+    patch: { stageId: input.toStageId },
+  });
+}
+
+export async function deleteLead(input: { workspaceId: string; leadId: string }) {
   const lead = await db.leads.get(input.leadId);
   if (!lead) return;
   if (lead.workspaceId !== input.workspaceId) return;

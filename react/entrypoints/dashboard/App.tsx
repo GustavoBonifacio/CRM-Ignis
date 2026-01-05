@@ -1,341 +1,302 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  BOARDS,
-  Board,
-  Lead,
-  loadLeadsState,
-  removeLead,
-  restoreLead,
-  STAGES,
-  Stage,
-  upsertLead,
-  updateLead,
-} from "../../src/crm/leadsStore";
+import React from "react";
+import type { BoardType } from "../../src/db/db";
+import { deleteLead, listLeadsByBoard, moveLeadStage, updateLead } from "../../src/db/leadsRepo";
 
-type ToastState =
-  | { type: "none" }
-  | { type: "deleted"; lead: Lead; index: number; until: number };
+const WORKSPACE_ID = "default";
 
-function parseInstagramProfile(url: string): { username: string; profileUrl: string } | null {
-  const m = url.match(/https?:\/\/(www\.)?instagram\.com\/([^/?#]+)\/?/i);
-  if (!m) return null;
+const STAGES = [
+  "Leads novos",
+  "Abordagem enviada",
+  "Abordagem respondida",
+  "Pergunta enviada",
+  "Pergunta respondida",
+  "CTA realizado",
+  "Aceitou call",
+  "Agendamento completo",
+  "Compareceu",
+  "No-show",
+  "Reagendar",
+  "Fechado (ganho)",
+  "Perdido",
+] as const;
 
-  const username = m[2]?.trim();
-  if (!username) return null;
-
-  const blocked = new Set(["p", "reel", "tv", "stories", "explore", "direct", "accounts"]);
-  if (blocked.has(username.toLowerCase())) return null;
-
-  const profileUrl = `https://www.instagram.com/${username}/`;
-  return { username, profileUrl };
+type Toast = { id: string; message: string; kind: "ok" | "warn" | "error" };
+function newId() {
+  return crypto.randomUUID();
 }
 
 export default function App() {
-  const [activeBoard, setActiveBoard] = useState<Board>("OUTBOUND");
-  const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [leads, setLeads] = useState<Lead[]>([]);
-  const [toast, setToast] = useState<ToastState>({ type: "none" });
+  const [board, setBoard] = React.useState<BoardType>("OUTBOUND");
+  const [leads, setLeads] = React.useState<any[]>([]);
+  const [search, setSearch] = React.useState("");
+  const [toast, setToast] = React.useState<Toast | null>(null);
 
-  const [confirmDelete, setConfirmDelete] = useState<null | { id: string; username: string }>(null);
-
-  const noteTimers = useRef<Map<string, number>>(new Map());
-
-  async function refresh() {
-    setLoading(true);
-    const state = await loadLeadsState();
-    const list = state.order
-      .map((id) => state.leadsById[id])
-      .filter(Boolean);
-
-    setLeads(list as Lead[]);
-    setLoading(false);
-  }
-
-  useEffect(() => {
-    void refresh();
-
-    // Atualiza automaticamente se algo mudar no storage (ex.: outra tela salvar)
-    const handler = () => void refresh();
-    browser.storage.onChanged.addListener(handler);
-    return () => browser.storage.onChanged.removeListener(handler);
+  const showToast = React.useCallback((message: string, kind: Toast["kind"] = "ok") => {
+    const t = { id: newId(), message, kind };
+    setToast(t);
+    window.setTimeout(() => setToast((cur) => (cur?.id === t.id ? null : cur)), 2500);
   }, []);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
+  const reload = React.useCallback(async () => {
+    const items = await listLeadsByBoard(WORKSPACE_ID, board);
+    setLeads(items);
+  }, [board]);
 
-    return leads.filter((l) => {
-      if (l.board !== activeBoard) return false;
-      if (!q) return true;
-      const hay = `${l.username} ${l.note} ${l.stage}`.toLowerCase();
-      return hay.includes(q);
-    });
-  }, [leads, activeBoard, query]);
+  React.useEffect(() => {
+    void reload();
+  }, [reload]);
 
-  const grouped = useMemo(() => {
-    const map: Record<Stage, Lead[]> = Object.create(null);
-    for (const s of STAGES) map[s.id] = [];
-    for (const lead of filtered) map[lead.stage].push(lead);
+  const filtered = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return leads;
+    return leads.filter(
+      (l) =>
+        String(l.username || "").toLowerCase().includes(q) ||
+        String(l.displayName || "").toLowerCase().includes(q),
+    );
+  }, [leads, search]);
+
+  const byStage = React.useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const s of STAGES) map.set(s, []);
+    for (const l of filtered) {
+      const sid = String(l.stageId || "Leads novos");
+      if (!map.has(sid)) map.set(sid, []);
+      map.get(sid)!.push(l);
+    }
     return map;
   }, [filtered]);
 
-  async function onCapture() {
+  async function onDropLead(leadId: string, toStageId: string) {
     try {
-      const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-      const tab = tabs?.[0];
-      const url = tab?.url;
-
-      if (!url) {
-        alert(
-          "Não consegui ler a URL da aba ativa.\n\nDica: abra um perfil do Instagram e tente de novo. Se persistir, precisamos conferir permissões (tabs/activeTab) no manifest."
-        );
-        return;
-      }
-
-      const parsed = parseInstagramProfile(url);
-      if (!parsed) {
-        alert("Isso não parece ser um perfil do Instagram.\n\nAbra o perfil (instagram.com/usuario/) e clique em Capturar.");
-        return;
-      }
-
-      await upsertLead({ ...parsed, board: activeBoard });
-      await refresh();
-    } catch (e) {
+      await moveLeadStage({ workspaceId: WORKSPACE_ID, leadId, toStageId });
+      await reload();
+    } catch (e: any) {
       console.error(e);
-      alert("Falha ao capturar. Veja o console da Dashboard.");
+      showToast(e?.message || "Erro ao mover lead", "error");
     }
   }
 
-  function scheduleNoteSave(id: string, note: string) {
-    const existing = noteTimers.current.get(id);
-    if (existing) window.clearTimeout(existing);
-
-    const t = window.setTimeout(() => {
-      void updateLead(id, { note, updatedAt: new Date().toISOString() });
-      noteTimers.current.delete(id);
-    }, 550);
-
-    noteTimers.current.set(id, t);
-  }
-
-  async function onChangeStage(id: string, stage: Stage) {
-    await updateLead(id, { stage, updatedAt: new Date().toISOString() });
-    await refresh();
-  }
-
-  function getNextStage(stage: Stage): Stage | null {
-    const idx = STAGES.findIndex((s) => s.id === stage);
-    if (idx < 0) return null;
-    if (idx >= STAGES.length - 1) return null;
-    return STAGES[idx + 1].id;
-  }
-
-  async function requestDelete(id: string, username: string) {
-    setConfirmDelete({ id, username });
-  }
-
-  async function confirmDeleteNow(id: string) {
-    // descobre o índice na lista atual (ordem global)
-    const index = leads.findIndex((l) => l.id === id);
-
-    const deleted = await removeLead(id);
-    await refresh();
-    setConfirmDelete(null);
-
-    if (deleted) {
-      const until = Date.now() + 10_000;
-      setToast({ type: "deleted", lead: deleted, index: index < 0 ? 0 : index, until });
+  async function onDeleteLead(leadId: string, username: string) {
+    try {
+      await deleteLead({ workspaceId: WORKSPACE_ID, leadId });
+      showToast(`🗑️ Removido: @${username}`, "warn");
+      await reload();
+    } catch (e: any) {
+      console.error(e);
+      showToast(e?.message || "Erro ao remover lead", "error");
     }
   }
-
-  async function undoDelete() {
-    if (toast.type !== "deleted") return;
-    await restoreLead(toast.lead, toast.index);
-    await refresh();
-    setToast({ type: "none" });
-  }
-
-  // auto-dismiss toast
-  useEffect(() => {
-    if (toast.type !== "deleted") return;
-    const ms = Math.max(0, toast.until - Date.now());
-    const t = window.setTimeout(() => setToast({ type: "none" }), ms);
-    return () => window.clearTimeout(t);
-  }, [toast]);
-
-  const boardLabel = BOARDS.find((b) => b.id === activeBoard)?.label ?? activeBoard;
 
   return (
-    <div className="container">
-      <div className="topbar">
-        <div className="topbar-inner">
-          <div className="brand">
-            <div className="logo" />
-            <div>CRM IGNIS</div>
-          </div>
+    <div className="min-h-screen bg-[rgb(var(--bg))] text-[rgb(var(--text))]">
+      {/* Header */}
+      <div className="sticky top-0 z-10 border-b border-[rgb(var(--border))] bg-[rgb(var(--bg))]/80 backdrop-blur">
+        <div className="w-full px-3 md:px-4 py-3 flex items-center gap-3">
+          <div className="font-black tracking-tight text-lg">CRM IGNIS • Kanban</div>
 
-          <div className="nav">
-            {BOARDS.map((b) => (
-              <button
-                key={b.id}
-                className={`navbtn ${activeBoard === b.id ? "active" : ""}`}
-                onClick={() => setActiveBoard(b.id)}
-                title={`Ver funil: ${b.label}`}
-              >
-                {b.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="spacer" />
-
-          <input
-            className="search"
-            placeholder="Buscar por username, nota ou etapa..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-
-          <div className="actions">
-            <select className="select" value={activeBoard} onChange={(e) => setActiveBoard(e.target.value as Board)}>
-              {BOARDS.map((b) => (
-                <option key={b.id} value={b.id}>
-                  Capturar em: {b.label}
-                </option>
-              ))}
-            </select>
-
-            <button className="primary" onClick={onCapture}>
-              + Capturar
+          <div className="flex items-center gap-2 ml-2">
+            <button
+              className={
+                "text-xs px-3 py-1 rounded-[var(--radius)] border " +
+                (board === "OUTBOUND"
+                  ? "border-[rgb(var(--accent))] bg-white/5"
+                  : "border-[rgb(var(--border))] hover:bg-white/5")
+              }
+              onClick={() => setBoard("OUTBOUND")}
+            >
+              Outbound
+            </button>
+            <button
+              className={
+                "text-xs px-3 py-1 rounded-[var(--radius)] border " +
+                (board === "SOCIAL"
+                  ? "border-[rgb(var(--accent))] bg-white/5"
+                  : "border-[rgb(var(--border))] hover:bg-white/5")
+              }
+              onClick={() => setBoard("SOCIAL")}
+            >
+              Social Selling
             </button>
           </div>
+
+          <div className="flex-1" />
+
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Buscar @username…"
+            className="text-xs w-[260px] max-w-[45vw] px-3 py-2 rounded-[var(--radius)] bg-[rgb(var(--panel))] border border-[rgb(var(--border))] outline-none focus:border-[rgb(var(--accent))]"
+          />
+
+          <button
+            className="text-xs px-3 py-2 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5"
+            onClick={() => void reload()}
+            title="Recarregar"
+          >
+            Recarregar
+          </button>
         </div>
       </div>
 
-      <div className="page">
-        <div className="boardHeader">
-          <div>
-            <h1 className="h1">Pipeline — {boardLabel}</h1>
-            <p className="sub">
-              {loading ? "Carregando..." : `${filtered.length} lead(s) no funil • Arraste mentalmente: por enquanto é por seletor/Next 🙂`}
-            </p>
+      {/* Kanban */}
+      <div className="w-full px-3 md:px-4 py-4">
+        <div className="overflow-x-auto">
+          <div className="flex gap-3 pb-4 min-w-max">
+            {STAGES.map((stage) => (
+              <KanbanColumn
+                key={stage}
+                stageId={stage}
+                title={stage}
+                items={byStage.get(stage) ?? []}
+                onDropLead={onDropLead}
+                onDeleteLead={onDeleteLead}
+                onUpdateNotes={async (leadId, notes) => {
+                  await updateLead({ workspaceId: WORKSPACE_ID, leadId, patch: { notes } });
+                }}
+              />
+            ))}
           </div>
         </div>
 
-        <div className="hscroll">
-          <div className="columns">
-            {STAGES.map((col) => {
-              const items = grouped[col.id] ?? [];
-              return (
-                <div className="column" key={col.id}>
-                  <div className="colTop">
-                    <div className="colTitle">
-                      {col.label} <span className="badge">{items.length}</span>
-                    </div>
-                  </div>
-
-                  <div className="colBody">
-                    {items.length === 0 ? (
-                      <div className="empty">Nenhum lead aqui</div>
-                    ) : (
-                      items.map((lead) => {
-                        const next = getNextStage(lead.stage);
-                        return (
-                          <div className="card" key={lead.id}>
-                            <div className="cardTop">
-                              <div className="userBlock">
-                                <a className="username" href={lead.profileUrl} target="_blank" rel="noreferrer">
-                                  @{lead.username}
-                                </a>
-                                <div className="meta">
-                                  <span className="pill">{lead.board}</span>
-                                  <span className="pill">{new Date(lead.updatedAt).toLocaleString()}</span>
-                                </div>
-                              </div>
-
-                              <div className="cardActions">
-                                <button
-                                  className="iconBtn danger"
-                                  title="Remover lead"
-                                  onClick={() => void requestDelete(lead.id, lead.username)}
-                                >
-                                  🗑️
-                                </button>
-                              </div>
-                            </div>
-
-                            {/* NOTA SEMPRE VISÍVEL */}
-                            <textarea
-                              className="note"
-                              placeholder="Nota rápida (sempre visível)…"
-                              defaultValue={lead.note}
-                              onChange={(e) => scheduleNoteSave(lead.id, e.target.value)}
-                            />
-
-                            <div className="cardBottom">
-                              <select
-                                className="smallSelect"
-                                value={lead.stage}
-                                onChange={(e) => void onChangeStage(lead.id, e.target.value as Stage)}
-                                title="Mover etapa"
-                              >
-                                {STAGES.map((s) => (
-                                  <option key={s.id} value={s.id}>
-                                    {s.label}
-                                  </option>
-                                ))}
-                              </select>
-
-                              <button
-                                className="nextBtn"
-                                disabled={!next}
-                                onClick={() => next && void onChangeStage(lead.id, next)}
-                                title="Mover para a próxima etapa"
-                              >
-                                Next →
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        <div className="text-xs text-[rgb(var(--muted))] mt-2">
+          Arraste o card para outra coluna para mudar o estágio. A nota rápida fica sempre visível.
         </div>
       </div>
 
-      {/* Toast de delete + undo */}
-      {toast.type === "deleted" && (
-        <div className="toast">
-          <div>
-            <strong>@{toast.lead.username}</strong> removido.
+      {/* Toast */}
+      {toast ? (
+        <div className="fixed right-4 bottom-4 z-50">
+          <div
+            className={
+              "text-xs font-bold px-3 py-2 rounded-[var(--radius)] border shadow-[var(--shadow-sm)] backdrop-blur " +
+              (toast.kind === "error"
+                ? "bg-red-500/20 border-red-500/30"
+                : toast.kind === "warn"
+                  ? "bg-yellow-500/15 border-yellow-500/25"
+                  : "bg-emerald-500/15 border-emerald-500/25")
+            }
+          >
+            {toast.message}
           </div>
-          <button onClick={() => void undoDelete()}>Desfazer</button>
         </div>
-      )}
+      ) : null}
+    </div>
+  );
+}
 
-      {/* Modal confirmação */}
-      {confirmDelete && (
-        <div className="modalOverlay" onMouseDown={() => setConfirmDelete(null)}>
-          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
-            <h3>Remover lead?</h3>
-            <p>
-              Você vai remover <strong>@{confirmDelete.username}</strong> do CRM.
-            </p>
-            <div className="modalActions">
-              <button className="btn" onClick={() => setConfirmDelete(null)}>
-                Cancelar
-              </button>
-              <button className="btn danger" onClick={() => void confirmDeleteNow(confirmDelete.id)}>
-                Remover
-              </button>
-            </div>
-          </div>
+function KanbanColumn(props: {
+  stageId: string;
+  title: string;
+  items: any[];
+  onDropLead: (leadId: string, toStageId: string) => Promise<void>;
+  onDeleteLead: (leadId: string, username: string) => Promise<void>;
+  onUpdateNotes: (leadId: string, notes: string) => Promise<void>;
+}) {
+  function onDragOver(e: React.DragEvent) {
+    e.preventDefault();
+  }
+
+  async function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const leadId = e.dataTransfer.getData("text/leadId");
+    if (!leadId) return;
+    await props.onDropLead(leadId, props.stageId);
+  }
+
+  return (
+    <div
+      className="w-[320px] shrink-0 rounded-[var(--radius)] bg-[rgb(var(--panel))] border border-[rgb(var(--border))] shadow-[var(--shadow-sm)]"
+      onDragOver={onDragOver}
+      onDrop={(e) => void onDrop(e)}
+    >
+      <div className="px-3 py-2 border-b border-[rgb(var(--border))] flex items-center gap-2">
+        <div className="text-xs font-extrabold">{props.title}</div>
+        <div className="text-[10px] px-2 py-0.5 rounded-full border border-[rgb(var(--border))] text-[rgb(var(--muted))]">
+          {props.items.length}
         </div>
-      )}
+      </div>
+
+      <div className="p-3 flex flex-col gap-2 min-h-[90px]">
+        {props.items.length === 0 ? (
+          <div className="text-xs text-[rgb(var(--muted))]">Solte cards aqui…</div>
+        ) : null}
+
+        {props.items.map((l) => (
+          <LeadCard
+            key={l.id}
+            lead={l}
+            onDelete={() => void props.onDeleteLead(l.id, l.username)}
+            onUpdateNotes={(notes) => void props.onUpdateNotes(l.id, notes)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LeadCard(props: { lead: any; onDelete: () => void; onUpdateNotes: (notes: string) => void }) {
+  const { lead } = props;
+  const [notes, setNotes] = React.useState<string>(lead.notes || "");
+  const tRef = React.useRef<number | null>(null);
+
+  React.useEffect(() => {
+    setNotes(String(lead.notes || ""));
+  }, [lead.notes]);
+
+  function scheduleSave(next: string) {
+    if (tRef.current) window.clearTimeout(tRef.current);
+    tRef.current = window.setTimeout(() => props.onUpdateNotes(next), 400);
+  }
+
+  return (
+    <div
+      className="rounded-[var(--radius)] bg-white/5 border border-[rgb(var(--border))] p-3 cursor-grab active:cursor-grabbing"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData("text/leadId", lead.id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
+    >
+      <div className="flex items-start gap-2">
+        <div className="flex-1">
+          <div className="text-xs font-extrabold">
+            <a
+              className="hover:underline"
+              href={`https://www.instagram.com/${lead.username}/`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              @{lead.username}
+            </a>
+          </div>
+          {lead.displayName ? (
+            <div className="text-[11px] text-[rgb(var(--muted))]">{lead.displayName}</div>
+          ) : null}
+        </div>
+
+        <button
+          className="text-[11px] px-2 py-1 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5"
+          onClick={props.onDelete}
+          title="Remover lead"
+        >
+          Remover
+        </button>
+      </div>
+
+      <div className="mt-2">
+        <div className="text-[10px] text-[rgb(var(--muted))] mb-1">Nota rápida</div>
+        <textarea
+          value={notes}
+          onChange={(e) => {
+            const v = e.target.value;
+            setNotes(v);
+            scheduleSave(v);
+          }}
+          placeholder="Digite uma nota…"
+          className="w-full text-xs min-h-[56px] max-h-[140px] resize-y px-2 py-2 rounded-[var(--radius)] bg-[rgb(var(--bg))]/40 border border-[rgb(var(--border))] outline-none focus:border-[rgb(var(--accent))]"
+        />
+      </div>
     </div>
   );
 }

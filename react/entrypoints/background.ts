@@ -3,55 +3,37 @@ import { defineBackground } from "wxt/utils/define-background";
 
 type Board = "OUTBOUND" | "SOCIAL";
 
+const WORKSPACE_ID = "default";
+
 function normalizeUsername(raw: string) {
   return raw.replace(/^@+/, "").trim().toLowerCase();
 }
 
 async function addLeadInRepo(username: string, board: Board) {
-  // Import dinâmico pra NÃO quebrar build se o export tiver nome diferente
   const repo: any = await import("../src/db/leadsRepo");
 
-  const payload = {
-    username,
-    board,
-    workspace: "Padrão",
-    source: "IG_BUTTONS",
-  };
-
-  // Tentativas (fica compatível com várias assinaturas possíveis)
-  const tries: Array<() => Promise<any>> = [];
-
+  // Assinatura correta do nosso repo atual (Dexie)
   if (typeof repo.addLead === "function") {
-    tries.push(() => Promise.resolve(repo.addLead(payload)));
-    tries.push(() => Promise.resolve(repo.addLead(username, board, "Padrão")));
-    tries.push(() => Promise.resolve(repo.addLead(username, board)));
-  }
-
-  if (typeof repo.upsertLead === "function") {
-    tries.push(() => Promise.resolve(repo.upsertLead(payload)));
-    tries.push(() => Promise.resolve(repo.upsertLead(username, board, "Padrão")));
-  }
-
-  if (typeof repo.createLead === "function" && typeof repo.saveLead === "function") {
-    tries.push(async () => {
-      const lead = await repo.createLead(payload);
-      return repo.saveLead(lead);
+    return repo.addLead({
+      workspaceId: WORKSPACE_ID,
+      board,
+      stageId: "LEADS_NOVOS",
+      username,
     });
   }
 
-  let lastErr: any = null;
-  for (const fn of tries) {
-    try {
-      return await fn();
-    } catch (e) {
-      lastErr = e;
-    }
-  }
+  throw new Error("leadsRepo.addLead não encontrado.");
+}
 
-  const exports = Object.keys(repo).sort().join(", ");
-  throw new Error(
-    `Não consegui chamar o repositório (leadsRepo). Exports encontrados: [${exports}]. Erro: ${lastErr?.message || lastErr}`
-  );
+function broadcastToast(message: string, board?: Board) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "CRM_IGNIS_TOAST",
+      payload: { message, board },
+    });
+  } catch {
+    // sem stress
+  }
 }
 
 export default defineBackground(() => {
@@ -63,22 +45,27 @@ export default defineBackground(() => {
     if (msg.type === "CRM_IGNIS_ADD_LEAD") {
       (async () => {
         try {
-          const username = normalizeUsername(String(msg.username || ""));
-          const board = msg.board as Board;
+          const username = normalizeUsername(String((msg as any).username || ""));
+          const board = (msg as any).board as Board;
 
           if (!username) throw new Error("username vazio/ inválido");
           if (board !== "OUTBOUND" && board !== "SOCIAL") throw new Error(`board inválido: ${board}`);
 
-          await addLeadInRepo(username, board);
+          const result = await addLeadInRepo(username, board);
 
-          sendResponse({ ok: true });
+          const status = result?.status as string | undefined;
+          if (status === "created") broadcastToast(`✅ Capturado: @${username}`, board);
+          if (status === "exists") broadcastToast(`⚠️ Já existe: @${username}`, board);
+          if (!status) broadcastToast(`✅ Salvo: @${username}`, board);
+
+          sendResponse({ ok: true, result });
         } catch (e: any) {
+          broadcastToast(`❌ Erro ao salvar lead: ${e?.message || String(e)}`);
           sendResponse({ ok: false, error: e?.message || String(e) });
         }
       })();
 
-      // IMPORTANTÍSSIMO: mantém o canal aberto pro sendResponse async
-      return true;
+      return true; // mantém canal aberto
     }
   });
 });

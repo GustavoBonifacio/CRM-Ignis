@@ -11,8 +11,23 @@ function tabToBoard(tab: Tab): BoardType | null {
   return null;
 }
 
-function defaultStageForBoard(board: BoardType) {
-  return board === "OUTBOUND" ? "Leads novos" : "Leads novos (social)";
+function getDashboardUrl() {
+  return chrome.runtime.getURL("dashboard.html");
+}
+
+async function openOrFocusDashboard() {
+  const dashboardUrl = getDashboardUrl();
+
+  const tabs = await chrome.tabs.query({});
+  const existing = tabs.find((t) => (t.url ? t.url.startsWith(dashboardUrl) : false));
+
+  if (existing?.id) {
+    await chrome.tabs.update(existing.id, { active: true });
+    if (existing.windowId) await chrome.windows.update(existing.windowId, { focused: true });
+    return;
+  }
+
+  await chrome.tabs.create({ url: dashboardUrl, active: true });
 }
 
 function cx(...parts: Array<string | false | undefined | null>) {
@@ -21,87 +36,45 @@ function cx(...parts: Array<string | false | undefined | null>) {
 
 export function SidePanelApp() {
   const [tab, setTab] = React.useState<Tab>("Outbound");
-  const [workspace, setWorkspace] = React.useState("Padrão");
   const workspaceId = "default";
 
   const activeBoard = tabToBoard(tab);
 
   const [leads, setLeads] = React.useState<any[]>([]);
   const [search, setSearch] = React.useState("");
-  const [toastMsg, setToastMsg] = React.useState<string>("");
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: "Outbound", label: "Outbound" },
-    { id: "Social", label: "Social Selling" },
-    { id: "Tasks", label: "Tasks" },
-    { id: "Filtros", label: "Filtros" },
-    { id: "Settings", label: "Settings" },
-  ];
+  const [toastMsg, setToastMsg] = React.useState<string | null>(null);
+  const toastTimer = React.useRef<number | null>(null);
 
-  function toast(msg: string) {
-    setToastMsg(msg);
-    window.setTimeout(() => setToastMsg(""), 2500);
+  function toast(m: string) {
+    setToastMsg(m);
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToastMsg(null), 2500);
   }
 
-  async function reload(boardOverride?: BoardType) {
+  const reload = React.useCallback(async () => {
+    if (!activeBoard) return;
     try {
-      const boardToLoad: BoardType = boardOverride ?? activeBoard ?? "OUTBOUND";
-      const items = await listLeadsByBoard(workspaceId, boardToLoad);
+      const items = await listLeadsByBoard(workspaceId, activeBoard);
       setLeads(items);
     } catch (err) {
       console.error(err);
       toast("Erro ao carregar leads (veja o Console).");
     }
-  }
+  }, [activeBoard]);
 
   React.useEffect(() => {
-    reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab]);
+    void reload();
+  }, [reload]);
 
-  // Listener: recebe toast do background + muda de aba se precisar
-  React.useEffect(() => {
-    const handler = (msg: any) => {
-      if (!msg || typeof msg !== "object") return;
-      if (msg.type !== "CRM_IGNIS_TOAST") return;
+  async function captureFromCurrentTab() {
+    if (!activeBoard) return;
 
-      const message = msg.payload?.message as string | undefined;
-      const board = msg.payload?.board as BoardType | undefined;
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const url = tabs?.[0]?.url;
 
-      if (message) toast(message);
-
-      // Se veio um lead Social e eu estou no Outbound, troco a aba automaticamente
-      if (board === "SOCIAL") setTab("Social");
-      if (board === "OUTBOUND") setTab("Outbound");
-
-      // recarrega a lista do board correto
-      if (board) reload(board);
-    };
-
-    chrome.runtime.onMessage.addListener(handler);
-    return () => chrome.runtime.onMessage.removeListener(handler);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function getActiveTabUrl(): Promise<string | null> {
-    try {
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      return tabs?.[0]?.url ?? null;
-    } catch (err) {
-      console.error(err);
-      return null;
-    }
-  }
-
-  async function handleCaptureProfile() {
-    if (!activeBoard) {
-      toast("Vá para Outbound ou Social Selling para capturar.");
-      return;
-    }
-
-    const url = await getActiveTabUrl();
     if (!url) {
-      toast("Não consegui ler a aba ativa. Abra um perfil do Instagram e tente de novo.");
+      toast("Não consegui ler a URL da aba ativa.");
       return;
     }
 
@@ -115,11 +88,11 @@ export function SidePanelApp() {
       const result = await addLead({
         workspaceId,
         board: activeBoard,
-        stageId: defaultStageForBoard(activeBoard),
+        stageId: "Leads novos",
         username: parsed.username,
       });
 
-      if (result.status === "created") toast(`✅ Capturado: @${result.lead.username} (${activeBoard})`);
+      if (result.status === "created") toast(`✅ Capturado: @${result.lead.username}`);
       if (result.status === "exists") toast(`⚠️ Já existe: @${result.lead.username}`);
 
       await reload();
@@ -129,35 +102,7 @@ export function SidePanelApp() {
     }
   }
 
-  async function handleAddTestLead() {
-    if (!activeBoard) {
-      toast("Vá para Outbound ou Social Selling para adicionar.");
-      return;
-    }
-
-    try {
-      const username = `lead_${Math.floor(Math.random() * 99999)}`;
-      const result = await addLead({
-        workspaceId,
-        board: activeBoard,
-        stageId: defaultStageForBoard(activeBoard),
-        username,
-      });
-
-      if (result.status === "created") toast(`✅ Lead @${result.lead.username} adicionado em ${activeBoard}`);
-      if (result.status === "exists") toast(`⚠️ Já existe: @${result.lead.username}`);
-
-      await reload();
-    } catch (err) {
-      console.error(err);
-      toast("Erro ao adicionar lead (veja o Console).");
-    }
-  }
-
-  async function handleDeleteLead(leadId: string, username: string) {
-    const ok = window.confirm("Tem certeza que deseja excluir esse lead?");
-    if (!ok) return;
-
+  async function onDelete(leadId: string, username: string) {
     try {
       await deleteLead({ workspaceId, leadId });
       toast(`🗑️ Lead @${username} excluído`);
@@ -168,130 +113,97 @@ export function SidePanelApp() {
     }
   }
 
-  const q = search.toLowerCase().trim();
-  const filtered = leads.filter((l) => {
-    if (!q) return true;
-    return String(l.usernameLower || "").includes(q);
-  });
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? leads.filter(
+        (l) =>
+          String(l.username || "").toLowerCase().includes(q) ||
+          String(l.displayName || "").toLowerCase().includes(q),
+      )
+    : leads;
 
   return (
-    <div className="h-screen w-full bg-[rgb(var(--bg))] text-[rgb(var(--text))]">
-      <div className="flex items-center gap-2 px-3 py-3 border-b border-[rgb(var(--border))] bg-[rgb(var(--panel))]">
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-semibold tracking-wide">CRM IGNIS</div>
-          <div className="text-[11px] text-[rgb(var(--muted))]">IG Buttons (Passo 6)</div>
-        </div>
-
-        <select
-          value={workspace}
-          onChange={(e) => setWorkspace(e.target.value)}
-          className="text-xs rounded-[var(--radius)] bg-transparent border border-[rgb(var(--border))] px-2 py-1 outline-none"
-        >
-          <option value="Padrão">Workspace: Padrão</option>
-        </select>
-
-        <button
-          onClick={handleCaptureProfile}
-          className="text-xs px-3 py-2 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5 active:bg-white/10 transition"
-          title="Fallback: pega o @ pela URL da aba ativa"
-        >
-          Capturar perfil
-        </button>
+    <div className="min-h-screen bg-[rgb(var(--bg))] text-[rgb(var(--text))] p-3">
+      <div className="flex items-center gap-2">
+        <div className="font-black">CRM IGNIS</div>
+        <div className="text-xs text-[rgb(var(--muted))]">• Padrão</div>
       </div>
 
-      <div className="flex gap-2 px-3 py-2 border-b border-[rgb(var(--border))] bg-[rgb(var(--panel))] overflow-x-auto">
-        {tabs.map((t) => (
+      <div className="flex gap-2 mt-3">
+        {(["Outbound", "Social", "Tasks", "Filtros", "Settings"] as Tab[]).map((t) => (
           <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
+            key={t}
             className={cx(
-              "text-xs px-3 py-2 rounded-full border transition whitespace-nowrap",
-              tab === t.id
-                ? "border-transparent bg-[rgb(var(--accent))] text-black"
-                : "border-[rgb(var(--border))] hover:bg-white/5 active:bg-white/10"
+              "text-xs px-3 py-1 rounded-[var(--radius)] border",
+              tab === t ? "border-[rgb(var(--accent))] bg-white/5" : "border-[rgb(var(--border))] hover:bg-white/5",
             )}
+            onClick={() => setTab(t)}
           >
-            {t.label}
+            {t}
           </button>
         ))}
       </div>
 
-      {toastMsg ? (
-        <div className="px-3 pt-3">
-          <div className="text-xs rounded-[var(--radius)] border border-[rgb(var(--border))] px-3 py-2 bg-white/5">
-            {toastMsg}
-          </div>
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          className="text-xs px-3 py-2 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5"
+          onClick={() => void captureFromCurrentTab()}
+          disabled={!activeBoard}
+        >
+          Capturar lead da aba atual
+        </button>
+
+        <button
+          className="text-xs px-3 py-2 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5"
+          onClick={() => void openOrFocusDashboard()}
+        >
+          Abrir Kanban
+        </button>
+      </div>
+
+      <div className="mt-3 flex items-center gap-2">
+        <input
+          className="text-xs w-full px-3 py-2 rounded-[var(--radius)] bg-[rgb(var(--panel))] border border-[rgb(var(--border))] outline-none focus:border-[rgb(var(--accent))]"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Buscar…"
+        />
+      </div>
+
+      <div className="mt-3 border border-[rgb(var(--border))] rounded-[var(--radius)] overflow-hidden">
+        <div className="p-2 text-xs font-bold border-b border-[rgb(var(--border))] bg-white/5">
+          Leads ({filtered.length})
         </div>
-      ) : null}
 
-      <div className="p-3 space-y-3">
-        <div className="rounded-[var(--radius)] border border-[rgb(var(--border))] bg-[rgb(var(--panel))] shadow-[var(--shadow-sm)] p-3">
-          <div className="text-sm font-semibold">Leads</div>
-
-          <div className="mt-2 flex items-center gap-2">
-            <button
-              onClick={handleAddTestLead}
-              className="text-xs px-3 py-2 rounded-full bg-[rgb(var(--accent))] text-black hover:opacity-90 active:opacity-80 transition"
-            >
-              + Adicionar lead teste
-            </button>
-
-            <button
-              onClick={() => reload()}
-              className="text-xs px-3 py-2 rounded-full border border-[rgb(var(--border))] hover:bg-white/5 active:bg-white/10 transition"
-            >
-              Recarregar
-            </button>
-
-            <div className="ml-auto text-[11px] text-[rgb(var(--muted))]">
-              Board: <span className="font-semibold">{activeBoard ?? "-"}</span> • Total:{" "}
-              <span className="font-semibold">{filtered.length}</span>
-            </div>
-          </div>
-
-          <div className="mt-3">
-            <div className="text-xs text-[rgb(var(--muted))] mb-2">Buscar por username</div>
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Ex: fulano"
-              className="w-full text-sm px-3 py-2 rounded-[var(--radius)] bg-transparent border border-[rgb(var(--border))] outline-none"
-            />
-          </div>
-
-          <div className="mt-3 space-y-2">
-            {filtered.slice(0, 20).map((l) => (
-              <div
-                key={l.id}
-                className="flex items-center justify-between rounded-[var(--radius)] border border-[rgb(var(--border))] px-3 py-2"
-              >
-                <div className="text-xs">
-                  <div className="font-semibold">@{l.username}</div>
-                  <div className="text-[rgb(var(--muted))]">{l.stageId}</div>
+        <div className="p-2 flex flex-col gap-2">
+          {filtered.map((l) => (
+            <div key={l.id} className="p-2 rounded-[var(--radius)] border border-[rgb(var(--border))] bg-white/5">
+              <div className="flex items-start gap-2">
+                <div className="flex-1">
+                  <div className="text-xs font-extrabold">@{l.username}</div>
+                  <div className="text-[11px] text-[rgb(var(--muted))]">{String(l.stageId || "")}</div>
                 </div>
-
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] px-2 py-1 rounded-full border border-[rgb(var(--border))]">
-                    {l.board}
-                  </span>
-
-                  <button
-                    onClick={() => handleDeleteLead(l.id, l.username)}
-                    title="Excluir lead"
-                    className="text-xs px-2 py-1 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5 active:bg-white/10 transition"
-                  >
-                    🗑️
-                  </button>
-                </div>
+                <button
+                  className="text-[11px] px-2 py-1 rounded-[var(--radius)] border border-[rgb(var(--border))] hover:bg-white/5"
+                  onClick={() => void onDelete(l.id, l.username)}
+                >
+                  Remover
+                </button>
               </div>
-            ))}
+            </div>
+          ))}
 
-            {filtered.length === 0 ? (
-              <div className="text-xs text-[rgb(var(--muted))] mt-2">Nenhum lead encontrado.</div>
-            ) : null}
-          </div>
+          {filtered.length === 0 ? (
+            <div className="text-xs text-[rgb(var(--muted))] mt-2">Nenhum lead encontrado.</div>
+          ) : null}
         </div>
       </div>
+
+      {toastMsg ? (
+        <div className="fixed right-3 bottom-3 text-xs font-bold px-3 py-2 rounded-[var(--radius)] border border-[rgb(var(--border))] bg-white/10 backdrop-blur shadow-[var(--shadow-sm)]">
+          {toastMsg}
+        </div>
+      ) : null}
     </div>
   );
 }
